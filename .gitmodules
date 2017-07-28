@@ -1,0 +1,3 @@
+[submodule "annoy"]
+	path = annoy
+	url = git@github.com:spotify/annoy.git
