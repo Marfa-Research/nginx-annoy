@@ -23,6 +23,7 @@ typedef struct {
 } uuid_map_t;
 
 
+// Annoy wrapper with uuid indexing
 typedef struct {
     void *a;
     uuid_map_t *by_id;
@@ -118,23 +119,8 @@ static void *ngx_annoy_create_loc_conf(ngx_conf_t *cf) {
     return lcf;
 }
 
-static char *ngx_annoy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
-    ngx_str_t *value;
-    value = cf->args->elts;
-    ngx_annoy_conf_t *c = conf;
 
-    if (c->a == NULL) {
-        char *id_map_path = malloc(sizeof(char *)*(1+value[1].len)); 
-        memcpy(id_map_path, value[1].data, value[1].len);
-        id_map_path[value[1].len] = '\0';
-
-        char *annoy_file_path = malloc(sizeof(char *)*(1+value[2].len)); 
-        memcpy(annoy_file_path, value[2].data, value[2].len);
-        annoy_file_path[value[2].len] = '\0';
-
-        c->a = annoy__create();
-        annoy__load(c->a, annoy_file_path);
-
+int id_map__load(ngx_conf_t *c, char *id_map_path) {
         c->by_id = NULL;
         c->by_uuid = NULL;
 
@@ -161,13 +147,35 @@ static char *ngx_annoy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
                 ++i;
             }
             fclose(f);
-        } 
-        else 
-            return NGX_CONF_ERROR;
+            return 0;
+        }
+        return 1;
+}
+ 
+static char *ngx_annoy(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_str_t *value;
+    value = cf->args->elts;
+    ngx_annoy_conf_t *c = conf;
+
+    if (c->a == NULL) {
+        char *id_map_path = malloc(sizeof(char *)*(1+value[1].len)); 
+        memcpy(id_map_path, value[1].data, value[1].len);
+        id_map_path[value[1].len] = '\0';
+
+        char *annoy_file_path = malloc(sizeof(char *)*(1+value[2].len)); 
+        memcpy(annoy_file_path, value[2].data, value[2].len);
+        annoy_file_path[value[2].len] = '\0';
+
+        c->a = annoy__create();
+        annoy__load(c->a, annoy_file_path);
+        int rc = id_map__load(c, id_map_path);
+        if (rc != 0)
+            return NGX_CONF_OK;
     }
     return NGX_CONF_OK;
 }
 
+// Request filter for top-k items related to item
 static char *ngx_annoy_search(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     ngx_http_core_loc_conf_t *lcf;
     lcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
@@ -185,17 +193,11 @@ static char *ngx_annoy_search(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     return NGX_CONF_OK;
 }
 
-static ngx_int_t ngx_annoy_handle_search(ngx_http_request_t *r) {
-    ngx_annoy_conf_t *conf;
-    conf = ngx_http_get_module_main_conf(r, ngx_annoy_mod);
-
-    ngx_annoy_loc_conf_t *lcf;
-    lcf = ngx_http_get_module_loc_conf(r, ngx_annoy_mod);
-
+// Response generation for nearest neighbor search using uuid of item for top-k
+void generate_response(output, conf, lcf){
     uuid_map_t *id_lookup;
     HASH_FIND(hh2, conf->by_uuid, lcf->content_uuid, strlen(lcf->content_uuid), id_lookup); 
 
-    char *output = malloc(lcf->n*40+12*sizeof(char *));
     char *pos = output;
 
     int32_t *ids = malloc(sizeof(int32_t *));
@@ -226,22 +228,24 @@ static ngx_int_t ngx_annoy_handle_search(ngx_http_request_t *r) {
     }
     pos += sprintf(pos, "]}");
     pos = "\0";
+}
 
+
+static ngx_int_t ngx_annoy_handle_search(ngx_http_request_t *r) {
+    ngx_annoy_conf_t *conf;
+    ngx_annoy_loc_conf_t *lcf;
+ 
     ngx_int_t rc;
     ngx_buf_t *b;
     ngx_chain_t out;
 
     const char *content_type = "application/json";
 
-    r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_length_n = strlen(output);
-    r->headers_out.content_type.len = sizeof(content_type)-1;
-    r->headers_out.content_type.data = (u_char *) content_type;
+    conf = ngx_http_get_module_main_conf(r, ngx_annoy_mod);
+    lcf = ngx_http_get_module_loc_conf(r, ngx_annoy_mod);
 
-    rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
-        return rc;
-    }
+    char *body = malloc(lcf->n*40+12*sizeof(char *));
+    generate_response_body(body, conf, lcf);
 
     b = ngx_calloc_buf(r->pool);
     if (b == NULL) {
@@ -251,12 +255,20 @@ static ngx_int_t ngx_annoy_handle_search(ngx_http_request_t *r) {
     b->last_buf = 1;
     b->last_in_chain = 1;
     b->memory = 1;
-
-    b->pos = (u_char *) output;
-    b->last = b->pos + strlen(output);
+    b->pos = (u_char *) body;
+    b->last = b->pos + strlen(body);
 
     out.buf = b;
     out.next = NULL;
 
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = strlen(body);
+    r->headers_out.content_type.len = sizeof(content_type)-1;
+    r->headers_out.content_type.data = (u_char *) content_type;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
     return ngx_http_output_filter(r, &out);
 }

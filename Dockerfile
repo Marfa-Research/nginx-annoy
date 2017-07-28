@@ -1,5 +1,4 @@
 FROM ubuntu:16.10
-MAINTAINER Joe Quadrino <joe@marfa.co>
 
 RUN apt-get update && \
     apt-get install -y build-essential gcc git zip wget \
